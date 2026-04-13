@@ -107,7 +107,11 @@ def _fake_app(tmp_path: Path, **state_overrides) -> types.SimpleNamespace:
     app._check_dangerous_op = lambda text: CollabApp._check_dangerous_op(app, text)
     app._handle_dangerous_op_abort = AsyncMock()
     app._role_preamble = lambda n, r: CollabApp._role_preamble(app, n, r)
+    app._last_turn_changed_files = {"claude": [], "codex": []}
+    app._master_request_handled = False
+    app._pending_wfm_pane = None
     app._format_prior_replies = lambda rs: CollabApp._format_prior_replies(app, rs)
+    app._format_prior_changed_files = lambda ts: CollabApp._format_prior_changed_files(app, ts)
     app._consume_collab_dirty_notice = MagicMock(return_value="")
     app._collab_rules_reminder = MagicMock(return_value="")
     return app
@@ -982,3 +986,97 @@ class TestDangerousOpDetection:
 
         app._handle_dangerous_op_abort.assert_not_awaited()
         assert app.latest_completed_reply["codex"] == "pushed ok"
+
+
+# ── Scenario: Two-phase WAITING_FOR_MASTER relay (D-066) ─────────────────────
+
+class TestWaitingForMasterRelay:
+    """_run_collaboration_loop D-066: first WFM relays; second WFM stops."""
+
+    def _relay_app(self, tmp_path: Path) -> types.SimpleNamespace:
+        """Fake app wired for relay-loop unit tests."""
+        app = _fake_app(tmp_path)
+        app.state.collaboration_active = True
+        app.state.stuck = False
+        app.state.auto_turn_count = 1   # >0 so first_relay=False → WFM is checked
+        app.state.last_speaker = "claude"
+        app.max_auto_turns = 12
+        app.session_approvals_granted = 0
+        app.session_approvals_denied = 0
+        # Real pause-check so WAITING_FOR_MASTER in latest_completed_reply triggers
+        app._should_pause_for_master = (
+            lambda skip_waiting_sentinel=False:
+            CollabApp._should_pause_for_master(app, skip_waiting_sentinel)
+        )
+        app._extract_master_request = MagicMock(return_value=None)
+        app._build_collaboration_prompt = MagicMock(return_value="relay-prompt")
+        app._invoke_claude = AsyncMock()
+        app._invoke_codex = AsyncMock()
+        return app
+
+    @pytest.mark.asyncio
+    async def test_first_wfm_relays_to_other_agent(self, tmp_path):
+        """First WAITING_FOR_MASTER from Claude sends one confirmation relay to Codex."""
+        app = self._relay_app(tmp_path)
+        app.latest_completed_reply["claude"] = "WAITING_FOR_MASTER"
+        app.latest_completed_reply["codex"] = "Some prior reply."
+
+        # After Codex receives the confirmation prompt, stop the loop.
+        async def stop(*_a, **_kw):
+            app.state.collaboration_active = False
+        app._invoke_codex.side_effect = stop
+
+        await CollabApp._run_collaboration_loop(app)
+
+        # Codex (other agent) received the confirmation prompt.
+        app._invoke_codex.assert_awaited_once()
+        # Claude was NOT invoked (confirmation went to Codex only).
+        app._invoke_claude.assert_not_awaited()
+        # Claude's WFM reply was cleared so the next loop check doesn't re-trigger.
+        assert app.latest_completed_reply["claude"] == ""
+        # Chat was not yet told "agents completed" — that happens on the second stop.
+        app._write_chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_second_wfm_stops_session(self, tmp_path):
+        """Second WAITING_FOR_MASTER (after confirmation relay) pauses the session."""
+        app = self._relay_app(tmp_path)
+        # Simulate state after confirmation relay: Claude's WFM was cleared, pending set.
+        app.latest_completed_reply["claude"] = ""
+        app.latest_completed_reply["codex"] = "WAITING_FOR_MASTER"
+        app._pending_wfm_pane = "claude"   # set during first WFM relay
+        app.state.auto_turn_count = 2
+
+        await CollabApp._run_collaboration_loop(app)
+
+        # Neither agent is invoked — loop stopped immediately.
+        app._invoke_codex.assert_not_awaited()
+        app._invoke_claude.assert_not_awaited()
+        # Session paused correctly.
+        assert app.state.collaboration_active is False
+        assert app.state.waiting_for_master is True
+        assert app.state.next_speaker == "master"
+        # Flag cleared on stop.
+        assert app._pending_wfm_pane is None
+        # Chat notification fired.
+        app._write_chat.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_normal_relay_clears_pending_wfm_pane(self, tmp_path):
+        """A normal relay turn resets _pending_wfm_pane so future WFMs get a fresh relay."""
+        app = self._relay_app(tmp_path)
+        # _pending_wfm_pane is set from a prior WFM, but this turn has no WFM.
+        app._pending_wfm_pane = "claude"
+        app.latest_completed_reply["claude"] = "Here is my implementation."
+        app.latest_completed_reply["codex"] = "Prior review text."
+
+        async def stop(*_a, **_kw):
+            app.state.collaboration_active = False
+        app._invoke_codex.side_effect = stop
+
+        await CollabApp._run_collaboration_loop(app)
+
+        # Normal relay fired (Codex is next after Claude).
+        app._invoke_codex.assert_awaited_once()
+        # Flag was cleared during the normal relay turn.
+        assert app._pending_wfm_pane is None

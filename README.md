@@ -2,6 +2,7 @@
 
 A three-pane collaboration TUI that puts you between Claude and Codex inside any repository. You direct, they implement and review.
 
+Produly made by Claude code, Codex and me :)
 > Requires [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex) installed and authenticated.
 
 ## Install
@@ -260,4 +261,56 @@ akritrim-colab run --codex-role reviewer --claude-role implementer
 akritrim-colab run --claude-model claude-opus-4-6
 akritrim-colab run --no-require-git
 akritrim-colab run --debug-log .collab/session/tui_debug.log
+```
+
+## Development
+
+**Clone and install in editable mode:**
+
+```bash
+git clone https://github.com/akritrim/akritrim-colab
+cd akritrim-colab
+pip install -e ".[dev]"
+```
+
+Or with `uv`:
+
+```bash
+uv pip install -e ".[dev]"
+```
+
+**Run from source** (after editable install):
+
+```bash
+akritrim-colab
+# or
+python -m akritrim_colab
+```
+
+**Run the test suite:**
+
+```bash
+pytest
+```
+
+Tests use `pytest-asyncio` (auto mode). No live agent connections are required — the test suite mocks all CLI subprocess calls.
+
+**Project layout:**
+
+```
+src/akritrim_colab/
+  app.py                     Main TUI — CollabApp, all UI, routing, and relay logic
+  cli.py                     Entry point — init / run subcommands, settings wiring
+  config.py                  ProjectConfig, AppSettings, path resolution
+  agents/
+    claude_adapter.py        Claude CLI wrapper — streaming, session resume
+    codex_adapter.py         Codex CLI wrapper — streaming, thread resume
+    stream_events.py         StreamEvent dataclass shared by both adapters
+tests/                       pytest test suite
+.collab/                     Per-repo collaboration files (created on first run)
+  memory.md                  Permanent decisions log
+  scratchpad.md              Open topics and working notes
+  rules.md                   Collaboration protocol rules
+  settings.toml              User configuration
+  session/                   Runtime state (gitignored)
 ```

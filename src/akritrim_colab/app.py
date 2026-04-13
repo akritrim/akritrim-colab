@@ -14,7 +14,7 @@ from typing import Literal, cast
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.timer import Timer
@@ -27,6 +27,12 @@ from .agents import ClaudeAdapter, CodexAdapter, StreamEvent
 from .config import AppSettings, ProjectConfig
 
 STUCK_PATTERN = re.compile(r"\b(?:i|we)\s+got\s+stuck\b", re.IGNORECASE)
+# Matches "Master: <request>" at the start of any line so the speaker-identity
+# prefix required by R-009 ("[Claude: ...]" on line 1) does not break detection.
+MASTER_REQUEST_PATTERN = re.compile(r"(?m)^Master:\s*(.+)")
+# Matches the WAITING_FOR_MASTER sentinel anywhere as a standalone line so that
+# the R-009 speaker-prefix line does not prevent detection.
+WAITING_FOR_MASTER_PATTERN = re.compile(r"(?m)^WAITING_FOR_MASTER\s*$", re.IGNORECASE)
 FILE_MENTION_PATTERN = re.compile(r"@([^\s@]+)")
 _ROUTING_NAMES: frozenset[str] = frozenset({"claude", "codex", "both", "master"})
 GIT_ERROR_PATTERN = re.compile(
@@ -708,19 +714,26 @@ class ApprovalModal(ModalScreen[bool]):
         padding: 1 2;
         width: 72;
         height: auto;
-        max-height: 24;
+        max-height: 30;
     }
     ApprovalModal #approval-title {
         text-style: bold;
         color: yellow;
         margin-bottom: 1;
+        height: auto;
     }
     ApprovalModal #approval-agent {
         color: $text-muted;
         margin-bottom: 1;
+        height: auto;
+    }
+    ApprovalModal #approval-scroll {
+        height: auto;
+        max-height: 16;
+        margin-bottom: 1;
     }
     ApprovalModal #approval-request {
-        margin-bottom: 1;
+        height: auto;
     }
     ApprovalModal Horizontal {
         align: center middle;
@@ -729,6 +742,12 @@ class ApprovalModal(ModalScreen[bool]):
     }
     ApprovalModal Button {
         margin: 0 2;
+    }
+    ApprovalModal #approval-hint {
+        color: $text-muted;
+        text-align: center;
+        height: auto;
+        margin-top: 1;
     }
     """
 
@@ -741,10 +760,12 @@ class ApprovalModal(ModalScreen[bool]):
         with Vertical():
             yield Static("⚠  APPROVAL REQUIRED", id="approval-title")
             yield Static(f"Requesting agent: {self._agent}", id="approval-agent")
-            yield Static(self._request, id="approval-request")
+            with VerticalScroll(id="approval-scroll"):
+                yield Static(self._request, id="approval-request")
             with Horizontal():
                 yield Button("Approve", id="btn-approve", variant="success")
                 yield Button("Deny", id="btn-deny", variant="error")
+            yield Static("y = approve  ·  n / Esc = deny", id="approval-hint")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "btn-approve")
@@ -864,7 +885,8 @@ class CollabApp(App[None]):
             model=codex_model,
             skip_git_check=not require_git,
         )
-        self.pending_approvals = 0
+        self.session_approvals_granted: int = 0  # cumulative approvals given this session
+        self.session_approvals_denied: int = 0   # cumulative denials given this session
         self.pane_history: dict[str, list[tuple[str, str]]] = {"claude": [], "codex": []}
         self.active_message: dict[str, str] = {"claude": "", "codex": ""}
         self.active_text: dict[str, str] = {"claude": "", "codex": ""}
@@ -882,12 +904,23 @@ class CollabApp(App[None]):
         # ("diff", str(idx)).  Path-keyed lookup is intentionally avoided so old entries
         # always open the correct patch even after the same file changes again in a later turn.
         self.turn_diff_entries: dict[str, list[tuple[str, str, int]]] = {"claude": [], "codex": []}
+        # Paths of files changed during the most-recent completed turn, per pane.
+        # Injected into the relay prompt so the reviewer agent knows which files changed.
+        self._last_turn_changed_files: dict[str, list[str]] = {"claude": [], "codex": []}
         # Chat log history for /export master (timestamp, speaker, message)
         self.chat_history: list[tuple[str, str, str]] = []
         # Set to True whenever memory.md or scratchpad.md is written mid-session.
         # Cleared after the notice is injected into the next agent prompt so that
         # agents always see a re-read instruction after any memory update.
         self._collab_files_dirty: bool = False
+        # Set by _surface_master_request when it shows the approval modal so that
+        # _dispatch_route knows to abort the current sequential pass (the modal's
+        # run_worker follow-up handles continuation independently).
+        self._master_request_handled: bool = False
+        # When one agent writes WAITING_FOR_MASTER, the other gets one confirmation
+        # turn before the session actually pauses.  This field tracks which pane
+        # triggered the first sentinel so we know when both have confirmed.
+        self._pending_wfm_pane: str | None = None
         # Dangerous-op enforcement state
         # Ops whose names appear here are allowed to execute without modal this session.
         self._active_approvals: set[str] = set()
@@ -1017,6 +1050,11 @@ class CollabApp(App[None]):
         )
         approved: bool = await self.push_screen_wait(ApprovalModal(speaker, request))
         if approved:
+            self.session_approvals_granted += 1
+        else:
+            self.session_approvals_denied += 1
+        self._refresh_status()
+        if approved:
             # Key on the specific command text so only this exact invocation is approved;
             # a later 'git push --force' will still prompt.
             self._active_approvals.add(cmd_key)
@@ -1044,6 +1082,7 @@ class CollabApp(App[None]):
             self._refresh_activity_indicator()
             self.state.waiting_for_master = True
             self.state.stuck = True
+            self.state.collaboration_active = False
             self.state.next_speaker = "master"
             self.persist_state()
             self._refresh_status()
@@ -1195,7 +1234,10 @@ class CollabApp(App[None]):
             self.state.stuck = False
             self.state.collaboration_active = False
             self.state.last_speaker = "master"
-            self.pending_approvals = max(0, self.pending_approvals - 1)
+            if command.kind == "approve":
+                self.session_approvals_granted += 1
+            else:
+                self.session_approvals_denied += 1
             self.pending_request_from = None
             self.pending_request_text = None
             self.persist_state()
@@ -1331,7 +1373,8 @@ class CollabApp(App[None]):
                 msg = command.message
                 if command.kind == "route":
                     prior = self._format_prior_replies(prior_replies)
-                    msg = f"{collab_notice}{collab_rules}\n{self._role_preamble('Claude', self.state.claude_role)}\n\n{msg}{prior}"
+                    files_ctx = self._format_prior_changed_files(targets[:index])
+                    msg = f"{collab_notice}{collab_rules}\n{self._role_preamble('Claude', self.state.claude_role)}\n\n{msg}{prior}{files_ctx}"
                 await self._invoke_claude(msg, final=final, next_speaker=next_speaker)
                 reply = self.latest_completed_reply["claude"]
                 if reply:
@@ -1340,13 +1383,35 @@ class CollabApp(App[None]):
                 msg = command.message
                 if command.kind == "route":
                     prior = self._format_prior_replies(prior_replies)
-                    msg = f"{collab_notice}{collab_rules}\n{self._role_preamble('Codex', self.state.codex_role)}\n\n{msg}{prior}"
+                    files_ctx = self._format_prior_changed_files(targets[:index])
+                    msg = f"{collab_notice}{collab_rules}\n{self._role_preamble('Codex', self.state.codex_role)}\n\n{msg}{prior}{files_ctx}"
                 await self._invoke_codex(msg, final=final, next_speaker=next_speaker)
                 reply = self.latest_completed_reply["codex"]
                 if reply:
                     prior_replies.append(("Codex", reply))
+            # Abort conditions — evaluated in priority order:
+            # 1. _surface_master_request showed a modal: its run_worker follow-up drives
+            #    continuation; abort the current sequential pass unconditionally.
+            # 2. stuck: never relay after a stuck/failed turn.
+            # 3. Non-final agent set waiting_for_master (dangerous-op denial, Master denial):
+            #    do not invoke subsequent agents in this pass.
+            # NOTE: a final agent setting waiting_for_master=True via normal completion is
+            # NOT an abort condition — that is the expected state before the relay loop runs.
+            if self._master_request_handled:
+                self._master_request_handled = False
+                self._debug(f"_dispatch_route: aborting after {target} — master request modal handled")
+                return
+            if self.state.stuck:
+                self._debug(f"_dispatch_route: aborting after {target} — stuck={self.state.stuck}")
+                return
+            if not final and self.state.waiting_for_master:
+                self._debug(
+                    f"_dispatch_route: aborting dispatch after {target} "
+                    f"(non-final waiting_for_master={self.state.waiting_for_master})"
+                )
+                return
 
-        if command.kind == "route" and self.state.collaboration_active:
+        if command.kind == "route" and self.state.collaboration_active and not self.state.stuck:
             self._debug("entering collaboration loop from route dispatch")
             await self._run_collaboration_loop()
         self._debug("_dispatch_route complete")
@@ -1364,6 +1429,7 @@ class CollabApp(App[None]):
             next_speaker=next_speaker,
         )
         diff_map = await loop.run_in_executor(None, self._compute_turn_delta, pre_state)
+        self._last_turn_changed_files["claude"] = sorted(diff_map.keys())
         await self._update_pane_diff_strip("claude", diff_map)
 
     async def _invoke_codex(self, message: str, final: bool, next_speaker: str) -> None:
@@ -1379,6 +1445,7 @@ class CollabApp(App[None]):
             next_speaker=next_speaker,
         )
         diff_map = await loop.run_in_executor(None, self._compute_turn_delta, pre_state)
+        self._last_turn_changed_files["codex"] = sorted(diff_map.keys())
         await self._update_pane_diff_strip("codex", diff_map)
 
     def _parse_input(self, raw: str) -> RouteCommand | None:
@@ -1968,29 +2035,28 @@ class CollabApp(App[None]):
         self.pane_history[pane].append(("System", message))
         self._write_pane(pane)
 
-    async def _surface_master_request(self, speaker: str, message: str, *, is_final: bool) -> None:
-        """Called after a stream completes.  If the agent said "Master: …", handle approval.
+    async def _surface_master_request(self, speaker: str, message: str) -> bool:
+        """Called after a stream completes.  If the agent said "Master: …", show approval modal.
 
-        When *is_final* is False the collaboration loop is still running and will handle the
-        approval itself — we only surface a visual notice here.
-        When *is_final* is True this was a direct invocation; we show the approval modal and
-        auto-dispatch the follow-up so Master doesn't have to type /approve or /deny.
+        Always shows the modal immediately — regardless of *is_final* — so that a Master:
+        request from a non-final agent in an @both dispatch is not silently swallowed.
+        Setting collaboration_active=False causes the relay loop to exit cleanly after the
+        modal is handled.
+
+        Returns True when a Master: request was found and the modal was shown, False otherwise.
+        Callers should not override waiting_for_master when this returns True.
         """
-        if not message.startswith("Master:"):
-            return
-        request = message[len("Master:"):].strip() or "Requested Master attention."
-        if not is_final:
-            # Collaboration loop will handle the modal in its own iteration.
-            self._write_chat("System", f"{speaker} requested Master attention: {request}")
-            self._refresh_status(extra=f"{speaker} requested Master")
-            return
-        # Direct invocation path — show modal and dispatch follow-up automatically.
+        _master_match = MASTER_REQUEST_PATTERN.search(message)
+        if not _master_match:
+            return False
+        request = _master_match.group(1).strip() or "Requested Master attention."
         self.pending_request_from = speaker.lower()
         self.pending_request_text = request
-        self.pending_approvals += 1
-        self._refresh_status()
         approved: bool = await self.push_screen_wait(ApprovalModal(speaker, request))
-        self.pending_approvals = max(0, self.pending_approvals - 1)
+        if approved:
+            self.session_approvals_granted += 1
+        else:
+            self.session_approvals_denied += 1
         self.pending_request_from = None
         self.pending_request_text = None
         decision = "Approved." if approved else "Denied."
@@ -2005,7 +2071,15 @@ class CollabApp(App[None]):
         target: Literal["claude", "codex", "both", "system"] = (
             raw_target if raw_target in ("claude", "codex") else "both"  # type: ignore[assignment]
         )
-        self.state.waiting_for_master = False
+        # On denial: stop the collaboration relay.
+        # On approval: keep collaboration_active so the relay loop can resume after
+        # the follow-up dispatch completes.
+        if not approved:
+            self.state.collaboration_active = False
+        self.state.waiting_for_master = not approved
+        # Signal _dispatch_route to abort its current sequential pass — the
+        # run_worker follow-up below handles continuation independently.
+        self._master_request_handled = True
         self.state.last_speaker = "master"
         self.persist_state()
         self._refresh_status()
@@ -2013,12 +2087,14 @@ class CollabApp(App[None]):
             self._dispatch_route(RouteCommand(kind="route", target=target, message=follow_up)),
             exclusive=True,
         )
+        return True
 
     def _extract_master_request(self) -> tuple[str, str] | None:
         for pane in ("codex", "claude"):
             text = self.latest_completed_reply[pane].strip()
-            if text.startswith("Master:"):
-                return pane, text[len("Master:"):].strip()
+            m = MASTER_REQUEST_PATTERN.search(text)
+            if m:
+                return pane, m.group(1).strip() or "Requested Master attention."
         return None
 
     def _refresh_status(self, extra: str = "") -> None:
@@ -2044,7 +2120,7 @@ class CollabApp(App[None]):
             f"| cls={self.state.instruction_class or '-'} "
             f"| mode={self.state.mode or '-'} "
             f"| turn={self.state.turn_index} "
-            f"| approvals={self.pending_approvals} "
+            f"| approved={self.session_approvals_granted} denied={self.session_approvals_denied} "
             f"| stuck={self.state.stuck} "
             f"| bootstrapped={self.state.protocol_bootstrapped} "
             f"| cmp={self.state.comparison_round} "
@@ -2259,9 +2335,12 @@ class CollabApp(App[None]):
         self._refresh_activity_indicator()
         self._write_transcript(speaker, message)
         self._write_chat(speaker, message)
-        await self._surface_master_request(speaker, message, is_final=final)
-
-        self.state.waiting_for_master = final
+        master_handled = await self._surface_master_request(speaker, message)
+        # Only write waiting_for_master from the final flag when no modal was shown.
+        # If the modal ran, _surface_master_request already set waiting_for_master correctly
+        # (True on denial, False on approval) — overwriting it here would undo that.
+        if not master_handled:
+            self.state.waiting_for_master = final
         self.state.next_speaker = next_speaker
         self.state.stuck = self.state.stuck or stuck_hint or failed or not message.strip()
         self.persist_state()
@@ -2378,12 +2457,14 @@ class CollabApp(App[None]):
                     pane, request_text = result
                     self.pending_request_from = pane
                     self.pending_request_text = request_text
-                    self.pending_approvals += 1
-                    self._refresh_status()
                     approved: bool = await self.push_screen_wait(
                         ApprovalModal(pane.capitalize(), request_text)
                     )
-                    self.pending_approvals = max(0, self.pending_approvals - 1)
+                    if approved:
+                        self.session_approvals_granted += 1
+                    else:
+                        self.session_approvals_denied += 1
+                    self._refresh_status()
                     self.pending_request_from = None
                     self.pending_request_text = None
                     decision = "Approved." if approved else "Denied."
@@ -2420,17 +2501,62 @@ class CollabApp(App[None]):
                         )
                         return
                 else:
-                    # WAITING_FOR_MASTER sentinel or stuck — agents completed naturally.
-                    self.state.collaboration_active = False
-                    self.state.waiting_for_master = True
-                    self.state.next_speaker = "master"
-                    self.persist_state()
-                    self._refresh_status()
-                    self._write_chat(
-                        "System",
-                        "Agents have completed their exchange — send a new instruction to continue.",
-                    )
-                    return
+                    # WAITING_FOR_MASTER sentinel or stuck.
+                    # On the *first* WAITING_FOR_MASTER from either agent, give the
+                    # other agent one confirmation turn so it can review and either
+                    # also write WAITING_FOR_MASTER (→ session pauses) or continue.
+                    # STUCK always stops immediately — no confirmation relay.
+                    wfm_pane: str | None = None
+                    for _p in ("codex", "claude"):
+                        if WAITING_FOR_MASTER_PATTERN.search(
+                            self.latest_completed_reply[_p].strip()
+                        ):
+                            wfm_pane = _p
+                            break
+
+                    if wfm_pane and self._pending_wfm_pane is None:
+                        # First agent done — relay one confirmation prompt to the other.
+                        self._pending_wfm_pane = wfm_pane
+                        other_pane = "codex" if wfm_pane == "claude" else "claude"
+                        wfm_name = "Claude" if wfm_pane == "claude" else "Codex"
+                        # Clear the sentinel reply so the next loop check doesn't
+                        # re-trigger on the same text.
+                        self.latest_completed_reply[wfm_pane] = ""
+                        confirm_prompt = (
+                            f"{wfm_name} has indicated the current task is complete.\n"
+                            f"Please review their final output and either write "
+                            f"`WAITING_FOR_MASTER` on its own line to confirm the "
+                            f"task is fully closed, or continue with any remaining "
+                            f"work or corrections."
+                        )
+                        self.state.auto_turn_count += 1
+                        self._debug(
+                            f"WFM from {wfm_pane}, relaying confirmation to {other_pane}"
+                        )
+                        self._write_transcript("System", confirm_prompt)
+                        if other_pane == "codex":
+                            await self._invoke_codex(
+                                confirm_prompt, final=True, next_speaker="master"
+                            )
+                        else:
+                            await self._invoke_claude(
+                                confirm_prompt, final=True, next_speaker="master"
+                            )
+                        continue
+                    else:
+                        # Both agents confirmed (or STUCK, or second WFM after
+                        # confirmation relay) — session pauses for Master.
+                        self._pending_wfm_pane = None
+                        self.state.collaboration_active = False
+                        self.state.waiting_for_master = True
+                        self.state.next_speaker = "master"
+                        self.persist_state()
+                        self._refresh_status()
+                        self._write_chat(
+                            "System",
+                            "Agents have completed their exchange — send a new instruction to continue.",
+                        )
+                        return
 
             if not self.latest_completed_reply["codex"].strip() or not self.latest_completed_reply["claude"].strip():
                 self._debug("collaboration loop missing latest replies")
@@ -2456,6 +2582,7 @@ class CollabApp(App[None]):
                 self._refresh_status()
                 return
 
+            self._pending_wfm_pane = None  # clear on every normal relay turn
             target = "codex" if self.state.last_speaker == "claude" else "claude"
             prompt = self._build_collaboration_prompt(target)
             self.state.auto_turn_count += 1
@@ -2522,9 +2649,9 @@ class CollabApp(App[None]):
             text = self.latest_completed_reply[pane].strip()
             if not text:
                 continue
-            if text.startswith("Master:"):
+            if MASTER_REQUEST_PATTERN.search(text):
                 return True
-            if not skip_waiting_sentinel and text.upper() == "WAITING_FOR_MASTER":
+            if not skip_waiting_sentinel and WAITING_FOR_MASTER_PATTERN.search(text):
                 return True
             if STUCK_PATTERN.search(text):
                 return True
@@ -2536,6 +2663,24 @@ class CollabApp(App[None]):
             return ""
         parts = [f"\n\n{name} replied:\n{text}" for name, text in replies]
         return "".join(parts)
+
+    def _format_prior_changed_files(self, prior_targets: list[str]) -> str:
+        """Return a changed-file summary for agents that completed earlier in this dispatch.
+
+        Called just before building the second-agent message in ``_dispatch_route`` so
+        the reviewer knows which files the implementer touched, same as in the relay loop.
+        Returns empty string when no files changed or no prior agents ran.
+        """
+        parts: list[str] = []
+        for pane in prior_targets:
+            files = self._last_turn_changed_files[pane]
+            if files:
+                name = "Claude" if pane == "claude" else "Codex"
+                file_lines = "\n".join(f"  - {p}" for p in files)
+                parts.append(f"Files changed this turn by {name}:\n{file_lines}")
+        if not parts:
+            return ""
+        return "\n\n" + "\n\n".join(parts)
 
     def _collab_rules_reminder(self) -> str:
         """Return a standing rules reminder injected into every agent prompt.
@@ -2575,11 +2720,20 @@ class CollabApp(App[None]):
         if target == "codex":
             target_name, target_role = "Codex", self.state.codex_role
             other_name, other_role = "Claude", self.state.claude_role
+            other_pane = "claude"
             other_text = self.latest_completed_reply["claude"]
         else:
             target_name, target_role = "Claude", self.state.claude_role
             other_name, other_role = "Codex", self.state.codex_role
+            other_pane = "codex"
             other_text = self.latest_completed_reply["codex"]
+
+        changed_files = self._last_turn_changed_files[other_pane]
+        if changed_files:
+            file_lines = "\n".join(f"  - {p}" for p in changed_files)
+            files_section = f"\n\nFiles changed this turn by {other_name}:\n{file_lines}"
+        else:
+            files_section = ""
 
         notice = self._consume_collab_dirty_notice()
         rules = self._collab_rules_reminder()
@@ -2595,6 +2749,7 @@ class CollabApp(App[None]):
             "Do NOT use `WAITING_FOR_MASTER` to hand off between agents mid-task: "
             "just reply normally and the TUI routes to the other agent automatically.\n\n"
             f"{other_name}'s latest reply:\n{other_text}"
+            f"{files_section}"
         )
 
     async def _run_comparison_round(self) -> None:
