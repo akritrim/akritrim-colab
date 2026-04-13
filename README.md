@@ -5,6 +5,9 @@ A three-pane collaboration TUI that puts you between Claude and Codex inside any
 Produly made by Claude code, Codex and me :)
 > Requires [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex) installed and authenticated.
 
+## Demo Video
+https://github.com/user-attachments/assets/fa969809-ceba-4762-aa98-525625b0d9ef
+
 ## Install
 
 ```bash
