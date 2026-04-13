@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "akritrim-colab"
+version = "0.1.15"
+description = "Three-party AI collaboration TUI for Codex, Claude, and the user"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Chandan Ranjan" }]
+keywords = ["collaboration", "ai", "tui", "claude", "codex"]
+dependencies = ["textual>=8.0.0", "rich>=13.0.0"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Environment :: Console",
+  "Topic :: Software Development :: User Interfaces",
+]
+
+[project.scripts]
+akritrim-colab = "akritrim_colab.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/akritrim_colab"]
+
+[project.urls]
+Homepage = "https://github.com/akritrim/akritrim-colab"
+Issues = "https://github.com/akritrim/akritrim-colab/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

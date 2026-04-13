@@ -1,0 +1,2 @@
+"""Standalone collab TUI package."""
+
