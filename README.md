@@ -2,7 +2,7 @@
 
 A three-pane collaboration TUI that puts you between Claude and Codex inside any repository. You direct, they implement and review.
 
-Produly made by Claude code, Codex and me :)
+Proudly made by Claude code, Codex and me :)
 > Requires [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex) installed and authenticated.
 
 ## Demo Video
