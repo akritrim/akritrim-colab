@@ -2105,10 +2105,15 @@ class CollabApp(App[None]):
     def _check_agent_prerequisites(self) -> None:
         """Warn at startup if cwd is not a git repo or required CLIs are absent.
 
-        Codex CLI requires a git repository by default. This can be overridden via:
+        Codex CLI always receives --skip-git-repo-check, so it will not fail on the
+        trusted-directory check regardless of whether this is a git repo.  However,
+        git-backed features (diffs, file context) require a real git repository.
+
+        ``require_git`` controls only whether this startup warning is emitted as a
+        prominent ⚠ (True) or a quieter ℹ (False).  It no longer gates Codex invocation.
           - settings.toml: ``require_git = false``
           - CLI flag:       ``--no-require-git`` (per-run; overrides settings.toml)
-          - CLI flag:       ``--require-git``    (force git even when settings has false)
+          - CLI flag:       ``--require-git``    (force-warn even when settings has false)
 
         Claude CLI runs anywhere but loses project-context-aware streaming outside
         a git repo — turning some turns into result-only responses with no text_delta.
@@ -2122,18 +2127,18 @@ class CollabApp(App[None]):
             if self.require_git:
                 msg = (
                     f"⚠ {cwd} is not a git repository. "
-                    "Codex will fail immediately (requires git). "
-                    "Claude will work but may emit result-only responses instead of streaming. "
+                    "Git-backed features (diffs, file context) will be unavailable. "
+                    "Claude may emit result-only responses instead of streaming. "
                     "Fix: run `git init` in this directory; "
-                    "or set require_git = false in .collab/settings.toml; "
+                    "or set require_git = false in .collab/settings.toml to suppress this warning; "
                     "or pass --no-require-git at launch."
                 )
             else:
                 msg = (
-                    f"ℹ {cwd} is not a git repository "
-                    "(require_git = false — Codex using --skip-git-repo-check). "
+                    f"ℹ {cwd} is not a git repository. "
+                    "Git-backed features (diffs, file context) will be unavailable. "
                     "Claude may emit result-only responses without a git project context. "
-                    "To re-enable the git requirement for this run, pass --require-git at launch."
+                    "To re-enable this warning, pass --require-git at launch."
                 )
             self._write_system("claude", msg)
             self._write_system("codex", msg)

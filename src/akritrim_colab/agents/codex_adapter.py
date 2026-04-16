@@ -91,16 +91,16 @@ class CodexAdapter:
         base = ["codex"]
         if self.model:
             base.extend(["--model", self.model])
+        # exec is the subcommand; --skip-git-repo-check belongs to exec, not codex root
+        base.append("exec")
         if self.skip_git_check:
             base.append("--skip-git-repo-check")
         if resume_handle:
-            base.extend(["exec", "resume"])
+            base.append("resume")
             if resume_handle == "__last__":
                 base.append("--last")
             else:
                 base.append(resume_handle)
-        else:
-            base.append("exec")
         base.extend(["--json", "-o", str(output_file), prompt])
         return base
 
@@ -181,12 +181,12 @@ class CodexAdapter:
         command = ["codex"]
         if self.model:
             command.extend(["--model", self.model])
+        # exec is the subcommand; --skip-git-repo-check belongs to exec, not codex root
+        command.append("exec")
         if self.skip_git_check:
             command.append("--skip-git-repo-check")
         if resume_handle:
-            command.extend(["exec", "resume", resume_handle])
-        else:
-            command.append("exec")
+            command.extend(["resume", resume_handle])
         command.extend(["--json", prompt])
 
         process = await asyncio.create_subprocess_exec(
