@@ -51,6 +51,7 @@ class CodexAdapter:
             result = subprocess.run(
                 command,
                 cwd=self.cwd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -191,6 +192,7 @@ class CodexAdapter:
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(self.cwd),
+            stdin=asyncio.subprocess.DEVNULL,  # prevent inheriting terminal stdin
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

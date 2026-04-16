@@ -81,13 +81,22 @@ class ClaudeReply:
 
 
 class ClaudeAdapter:
-    def __init__(self, cwd: Path, model: str | None = None, debug_log: Path | None = None) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        model: str | None = None,
+        debug_log: Path | None = None,
+        allow_dangerous_permissions: bool = True,
+    ) -> None:
         self.cwd = Path(cwd)
         self.model = model
         self.debug_log = debug_log
+        self.allow_dangerous_permissions = allow_dangerous_permissions
 
     def _base_command(self) -> list[str]:
-        cmd = ["claude", "-p", "--dangerously-skip-permissions"]
+        cmd = ["claude", "-p"]
+        if self.allow_dangerous_permissions:
+            cmd.append("--dangerously-skip-permissions")
         if self.model:
             cmd.extend(["--model", self.model])
         return cmd

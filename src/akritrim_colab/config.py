@@ -19,6 +19,7 @@ class AppSettings:
     theme: str | None = None
     require_git: bool = True
     dangerous_ops: list[str] | None = None  # None = use DANGEROUS_OPS_DEFAULT
+    claude_dangerously_skip_permissions: bool = True
 
     @classmethod
     def load(cls, path: Path) -> "AppSettings":
@@ -34,6 +35,9 @@ class AppSettings:
         require_git = app.get("require_git", True)
         if not isinstance(require_git, bool):
             require_git = True
+        claude_dangerously_skip_permissions = app.get("claude_dangerously_skip_permissions", True)
+        if not isinstance(claude_dangerously_skip_permissions, bool):
+            claude_dangerously_skip_permissions = True
         raw_ops = app.get("dangerous_ops")
         dangerous_ops: list[str] | None = None
         if isinstance(raw_ops, list):
@@ -55,6 +59,7 @@ class AppSettings:
             theme=_str("theme"),
             require_git=require_git,
             dangerous_ops=dangerous_ops,
+            claude_dangerously_skip_permissions=claude_dangerously_skip_permissions,
         )
 
     @staticmethod

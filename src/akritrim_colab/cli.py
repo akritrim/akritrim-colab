@@ -43,10 +43,18 @@ INIT_FILES = {
         'claude_model = "claude-sonnet-4-6"\n'
         'codex_model = "gpt-5.4"\n'
         '# debug_log = ".collab/session/tui_debug.log"\n'
-        "# Set to false to allow running outside a git repository.\n"
-        "# Codex will use --skip-git-repo-check; git-backed project context will be unavailable.\n"
-        "# Turn-local diff display still works. Can also be overridden per-run: --no-require-git\n"
+        "# Controls whether the TUI warns at startup when not inside a git repository.\n"
+        "# Set to false to suppress the warning (e.g. running in a non-git project).\n"
+        "# Note: --skip-git-repo-check is always passed to Codex regardless of this setting,\n"
+        "# because the TUI runs Codex non-interactively (stdin closed) and cannot answer\n"
+        "# Codex's interactive directory-trust prompt. git-backed features (diffs, file context)\n"
+        "# require a git repo regardless of this setting. Can also be overridden per-run: --no-require-git\n"
         "require_git = true\n"
+        "# Pass --dangerously-skip-permissions to the Claude CLI so it can execute tools\n"
+        "# without interactive confirmation prompts. Required for the TUI to function in\n"
+        "# fully-automated mode. Set to false only if you want Claude to handle its own\n"
+        "# permission prompts (the TUI approval modal will still gate dangerous ops).\n"
+        "claude_dangerously_skip_permissions = true\n"
         "# Operations that require explicit Master approval before an agent may execute them.\n"
         "# Agents must emit 'Master: requesting permission to [op]' and WAIT for your response.\n"
         "# Comment out or set to [] to disable the permission gate entirely.\n"
@@ -108,6 +116,7 @@ def cmd_run(config: ProjectConfig, args: argparse.Namespace) -> None:
         codex_model=settings.codex_model or None,
         require_git=require_git,
         dangerous_ops=settings.dangerous_ops,  # None → use DANGEROUS_OPS_DEFAULT
+        claude_dangerously_skip_permissions=settings.claude_dangerously_skip_permissions,
     )
     app.run()
 
